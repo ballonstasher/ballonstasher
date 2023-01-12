@@ -13,7 +13,8 @@ struct dcc_config_t {
 	bool exclusive_policy;
 	int metadata_type;
 	int filter_update_interval;
-	bool af_enable;
+	bool monitor_remote_status;
+	int max_rejected_ms;
 };
 
 extern struct dcc_config_t config;

@@ -6,7 +6,7 @@ typedef struct counting_bloom_filter {
     unsigned int  num_bits;
     size_t        bitmap_size;
     u8           *byte_bitmap;
-    rwlock_t 	 rw_lock;
+    seqlock_t lock;
 } cbf_t;
 
 cbf_t *cbf_init(u8, unsigned int);

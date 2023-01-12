@@ -23,7 +23,7 @@ static UniformDist pool_uni_dist(0, ULONG_MAX);
 PerCPUPool::PerCPUPool(void *start_addr) {
     total_fl_ = config.num_clients * rdma_config.num_data_qps;
     per_cli_fl_ = rdma_config.num_data_qps;
-
+    
     start_addr_ = (uintptr_t) start_addr;
     
     stat_start_time_ = 0;
@@ -244,7 +244,8 @@ void PerCPUPool::ShowStats() {
         uint64_t cur_time = ts.tv_nsec + ts.tv_sec * 1e9; 
         elapsed = (cur_time - stat_start_time_) / 1e9;
     }
-
+    
+    logger_->info("elapsed(sec)=%lu", elapsed);
     for (int i = 0; i < config.num_clients; i++) {
         logger_->info("[Cli%d] Util(%%)=%.1f, Used(MB)=%lu, "
                 "Free(MB)=%lu, Alloc(MB)=%lu", 

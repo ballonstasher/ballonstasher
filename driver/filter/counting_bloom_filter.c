@@ -22,7 +22,6 @@ cbf_t *cbf_init(u8 num_hash, unsigned int num_bits)
 		pr_err("failed to allocate cbf's byte bitmap");
 		goto out_err2;
 	}
-	rwlock_init(&filter->rw_lock);
 
 	pr_info("Counting BF, nr_hash=%u, num_bits=%u, bitmap_size(KB)=%lu", 
 			num_hash, num_bits, filter->bitmap_size/1024);
@@ -50,21 +49,17 @@ static inline unsigned int compute_hash(cbf_t *filter, unsigned int i,
 void cbf_add(cbf_t *filter, const void *data, unsigned int data_len) 
 {
 	unsigned int i, index;
-	unsigned long flags;
 
-	write_lock_irqsave(&filter->rw_lock, flags);
 	for (i = 0 ; i < filter->num_hash; i++) {
 		index = compute_hash(filter, i, data, data_len);
-		if (filter->byte_bitmap[index] < 255) {
+		if (filter->byte_bitmap[index] < 255)
 			filter->byte_bitmap[index]++;
-		} else {
-			//pr_err("index: %u exceeds 255 count", index);
-		}
+		else
+			pr_err("index: %u exceeds 255 count", index);
 	}
-	write_unlock_irqrestore(&filter->rw_lock, flags);
 }
 
-bool __cbf_might_contain(cbf_t *filter, const void *data, unsigned int data_len) {
+bool cbf_might_contain(cbf_t *filter, const void *data, unsigned int data_len) {
 	unsigned int i, index;
 	int ret = 1;
 
@@ -78,32 +73,17 @@ bool __cbf_might_contain(cbf_t *filter, const void *data, unsigned int data_len)
 	return ret;
 }
 
-bool cbf_might_contain(cbf_t *filter, const void *data, unsigned int data_len) {
-	int ret;
-	unsigned long flags;
-
-	read_lock_irqsave(&filter->rw_lock, flags);
-	ret = __cbf_might_contain(filter, data, data_len);
-	read_unlock_irqrestore(&filter->rw_lock, flags);
-	
-	return ret;
-}
-
 bool cbf_remove(cbf_t *filter, const void *data, unsigned int data_len) {
 	unsigned int i, index;
 	int ret = 0;
-	unsigned long flags;
 
-	write_lock_irqsave(&filter->rw_lock, flags);
-	if (__cbf_might_contain(filter, data, data_len)) {
+	if (cbf_might_contain(filter, data, data_len)) {
 		for (i = 0; i < filter->num_hash; i++) {
 			index = compute_hash(filter, i, data, data_len);
-			if (filter->byte_bitmap[index] >= 0)
-				filter->byte_bitmap[index]--;
+			filter->byte_bitmap[index]--;
 		}
 		ret = 1;
 	}
-	write_unlock_irqrestore(&filter->rw_lock, flags);
 
 	return ret;
 }

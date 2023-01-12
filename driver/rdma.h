@@ -132,9 +132,12 @@ struct dcc_rdma_ctrl {
 
 	unsigned long wait;
 	
-	unsigned long remote_enabled;
-	unsigned long disabled_when;
-
+	bool remote_disable;
+#if 1
+	unsigned long disable_when;
+#else
+	ktime_t disable_when;
+#endif
 	union {
 		struct sockaddr addr;
 		struct sockaddr_in addr_in;

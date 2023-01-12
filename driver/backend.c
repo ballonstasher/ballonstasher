@@ -5,6 +5,8 @@
 #include "stats.h"
 #include "breakdown.h"
 
+//define DCC_ACCESS_FILTER
+
 /* TODO: set default config */
 struct dcc_config_t config;
 
@@ -14,7 +16,8 @@ int svr_port = 50000;
 bool exclusive_policy = 1;
 int metadata_type = COOP_BF;
 int filter_update_interval = 5;
-bool af_enable = false;
+bool monitor_remote_status = true;
+int max_rejected_ms = 1000;
 
 module_param_string(cip, cli_ip, INET_ADDRSTRLEN, 0644);
 module_param_array(svr_ips, charp, NULL, 0644);
@@ -22,7 +25,8 @@ module_param(svr_port, int, 0644);
 module_param(exclusive_policy, bool, 0644);
 module_param(metadata_type, int, 0644);
 module_param(filter_update_interval, int, 0644);
-module_param(af_enable, bool, 0644);
+module_param(monitor_remote_status, bool, 0644);
+module_param(max_rejected_ms, int, 0644);
 
 struct dcc_backend **backends;
 bool dma_mem_for_filter = true;
@@ -72,10 +76,15 @@ int dcc_handle_put_page(struct page *page, ino_t ino, pgoff_t index)
 {
 	DECLARE_BACKEND_VAR(ino, index);
 
-	if (config.af_enable && !af_upsert(backend->af, ino, index))
+#ifdef DCC_ACCESS_FILTER
+	if (!af_upsert(backend->af, ino, index))
 		return -5;
+#endif
 
-	return __handle_twosided_put_page(page, key, meta, ctrl);
+	return __handle_twosided_put_page(page, key, meta, 
+			ctrl);
+
+	return -1;
 }
 EXPORT_SYMBOL_GPL(dcc_handle_put_page);
 
@@ -156,7 +165,8 @@ void dcc_set_default_config(void)
 	config.exclusive_policy = exclusive_policy;
 	config.metadata_type = metadata_type;
 	config.filter_update_interval = filter_update_interval;
-	config.af_enable = af_enable;
+	config.monitor_remote_status = monitor_remote_status;
+	config.max_rejected_ms = max_rejected_ms;
 }
 
 int dcc_backend_init(int id, struct dcc_rdma_ctrl *ctrl) 
@@ -191,8 +201,7 @@ int dcc_backend_init(int id, struct dcc_rdma_ctrl *ctrl)
 			goto out_err;
 	}
 
-	if (config.af_enable)
-		backend->af = af_init();
+	backend->af = af_init();
 
 	return 0;
 
@@ -260,9 +269,8 @@ void dcc_backend_exit(void)
 		
 		if (metadata_type)
 			metadata_exit(backends[i]->meta);
-		
-		if (config.af_enable)
-			af_exit(backends[i]->af);
+
+		af_exit(backends[i]->af);
 	}
 
 	for (i = 0; i < MAX_NUM_SVRS; i++) {

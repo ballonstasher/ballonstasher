@@ -64,7 +64,35 @@ inline void poll_send_cq(struct rdma_queue *q) {
     struct ibv_wc wc = {};
     __poll_cq(q->qp->send_cq, &wc, false);
 }
+#if 0
+inline int post_recv(struct rdma_queue *q, void *addr) {
+    struct ibv_sge sges[2] = {};
+    struct ibv_recv_wr wr = {};
+    struct ibv_recv_wr* bad_wr;
+    int ret;
 
+    wr.wr_id   = !addr ? 0 : (uint64_t) addr;
+    wr.next    = NULL;
+    wr.sg_list = sges;
+    wr.num_sge = !addr ? 0 : 2;
+
+    if (addr) {
+        sges[0].addr   = (uint64_t) addr;
+        sges[0].length = PAGE_SIZE;
+        sges[0].lkey   = q->ctrl->mm->GetDataMMPool()->mr->lkey;
+
+        sges[1].addr   = (uint64_t) ((uint64_t) addr + PAGE_SIZE);
+        sges[1].length = sizeof(uint64_t);
+        sges[1].lkey   = q->ctrl->mm->GetDataMMPool()->mr->lkey;
+    }
+
+    ret = ibv_post_recv(q->qp, &wr, &bad_wr);
+    if (ret)
+        fprintf(stderr, "failed to ibv_post_recv: %d\n", ret);
+
+    return ret;
+}
+#else
 inline int post_recv(struct rdma_queue *q, void *addr) {
     struct ibv_sge sge = {};
     struct ibv_recv_wr wr = {};
@@ -88,7 +116,7 @@ inline int post_recv(struct rdma_queue *q, void *addr) {
 
     return ret;
 }
-
+#endif
 inline int send_reply(struct rdma_queue *q, uint32_t imm_data, void *value, 
         uint64_t raddr) {
     unsigned int send_inline = !value ? IBV_SEND_INLINE : 0;
@@ -176,21 +204,22 @@ void process_put(struct rdma_queue *q, int cid, int qid, int mid,
     post_recv(q, value);
 
     kv->Insert(key, (Value_t) recv_addr, cid, qid);
+    dcc_end_ts(BR_PUTS, all);
 
 out:
     if (mid == rdma_config.num_msgs - 1) {
-        int etc = cpu_monitor->GetCPUUsage() > 50 ? 1 : 0; /* XXX: */
-
+        int etc = cpu_monitor->GetCPUUsage() > config.rejected_cpu_thld ? 1 : 0;
+        
+        //if (etc) printf("cpu=%d, etc=%d\n", cpu_monitor->GetCPUUsage(), etc); 
+        
         imm_data = htonl(bit_mask(mid, MSG_WRITE_REPLY, TX_WRITE_COMMITTED, 
                     etc, 0));
         if (send_reply(q, imm_data, NULL, 0)) {
             fprintf(stderr, "cannot reply put request\n");
             assert(0);       
         }
-        dcc_end_ts(BR_PUTS, all);
+		dcc_end_ts(BR_PUTS, all);
         poll_send_cq(q);
-    } else {
-        dcc_end_ts(BR_PUTS, all);
     }
 
     dcc_rdma_debug("(%d, %d, %d) key=%lu, recv_addr=0x%lx\n", 
@@ -213,9 +242,9 @@ static void process_get(struct rdma_queue *q, int cid, int qid, int mid) {
         value = kv->GetWithFlag(key, cid, qid, true);
     }
 
-    imm_data = htonl(bit_mask(mid, MSG_READ_REPLY, 
-                value ? TX_READ_COMMITTED : TX_READ_ABORTED,
-                0, value ? CRC8(value) : 0));
+	imm_data = htonl(bit_mask(mid, MSG_READ_REPLY, 
+				value ? TX_READ_COMMITTED : TX_READ_ABORTED,
+				0, value ? CRC8(value) : 0));
 
     if (send_reply(q, imm_data, value, raddr)) {
         fprintf(stderr, "cannot reply get request\n");
@@ -246,23 +275,20 @@ static void process_invalidate_page(struct rdma_queue *q, int cid, int qid,
     uint32_t imm_data;
     dcc_declare_ts(all);
 
-    dcc_start_ts(all);
+	dcc_start_ts(all);
     value = kv->Remove(key, cid, qid); 
     if (value)
         kv->Free(value, cid, -1); 
 
-    if (mid == rdma_config.num_msgs - 1) {
-        imm_data = htonl(bit_mask(mid, MSG_INV_PAGE_REPLY, 
-                    value ? TX_INV_PAGE_COMMITED : TX_INV_PAGE_ABORTED, 0, 0));
-        if (send_reply(q, imm_data, NULL, 0)) {
-            fprintf(stderr, "cannot reply inv page request\n");
-            assert(0);
-        }
-        dcc_end_ts(BR_INVS, all);
-        poll_send_cq(q);
-    } else {
-        dcc_end_ts(BR_INVS, all);
+    imm_data = htonl(bit_mask(mid, MSG_INV_PAGE_REPLY, 
+                value ? TX_INV_PAGE_COMMITED : TX_INV_PAGE_ABORTED, 0, 0));
+
+    if (send_reply(q, imm_data, NULL, 0)) {
+        fprintf(stderr, "cannot reply inv page request\n");
+        assert(0);
     }
+	dcc_end_ts(BR_INVS, all);
+    poll_send_cq(q);
 
     dcc_rdma_debug("(%d, %d, %d) key=%lu, value=%lu\n", 
             cid, qid, mid, key, value ? *(uint64_t *)value : 0);
@@ -354,10 +380,7 @@ void data_cq_poller(struct rdma_queue *queue, int qid) {
                         goto out_process;
                     break;
                 case GLOBAL_QP_POLLER:
-                    /* 
-                     * For fairness, poll the client next to the successful
-                     * client that you previously polled 
-                     */
+                    /* XXX */
                     while (1) {
                         q = &clients[idx]->ctrl->queues[qid];
                         ret = __poll_cq(q->qp->recv_cq, &wc, true);
@@ -403,8 +426,12 @@ void hybrid_data_cq_poller(struct rdma_queue *q, int qid) {
     int num_wc;
     using namespace std::chrono_literals;
     auto min_duration = (1 << 0) * 1ms;
-    auto max_duration = (1 << 10) * 1ms;
-    auto duration = config.wc_mode == WC_ADAPTIVE_BO ? (1 << 5) * 1ms : min_duration;
+    auto duration = (1 << 6) * 1ms;
+    //auto duration = (1 << 7) * 1ms;
+    //auto duration = (1 << 8) * 1ms;
+    //auto duration = (1 << 9) * 1ms;
+    //auto duration = (1 << 10) * 1ms; // XXX: too high
+    auto max_duration = duration;
 
     ret = ibv_req_notify_cq(q->event_cq, 0);
     if (ret) {
@@ -439,10 +466,12 @@ retry:
                 num_wc++;
             }
 
-            if (num_wc > 0)
-                succ_cnt++;
-            else
-                failed_cnt++;
+            if (config.wc_mode == WC_ADAPTIVE_BO) {
+                if (num_wc > 0)
+                    succ_cnt++;
+                else
+                    failed_cnt++;
+            }
 
             for (int i = 0; i < num_wc; i++) {
                 wc = &wc_arr[i];
@@ -475,17 +504,71 @@ retry:
         }
         ibv_ack_cq_events(cq, 1);
         goto event_mode;   
-#else 
-        if (!(succ_cnt + failed_cnt)) {
-            /* XXX: Never checked cq due to duration limit */
-            //throw std::runtime_error("succ_cnt + failed_cnt is 0");
-            goto retry;
-        }
+#else     
+        if (config.wc_mode == WC_ADAPTIVE_BO) {
+            if (!(succ_cnt + failed_cnt)) {
+                /* XXX: Never checked cq due to duration limit */
+                //throw std::runtime_error("succ_cnt + failed_cnt is 0");
+                goto retry;
+            }
 
-        int succ_rate = 100UL * succ_cnt / (succ_cnt + failed_cnt); 
-        if (!succ_rate) {
-            if (config.wc_mode == WC_ADAPTIVE_BO && duration > min_duration)
+            int succ_rate = 100UL * succ_cnt / (succ_cnt + failed_cnt); 
+#if 1
+            /* static duration based on succ rate */
+            if (succ_rate < 80) {
+                /* Request notification upon the next completion event */
+                ret = ibv_req_notify_cq(cq, 0);
+                if (ret) {
+                    fprintf(stderr, "Couldn't request CQ notification\n");
+                    die("ibv_req_notify_cq");
+                }
+                ibv_ack_cq_events(cq, 1);
+                goto event_mode;
+            } else {
+                goto poll_mode;
+            } 
+#endif 
+
+#if 0
+            if (succ_rate < 80 || duration == min_duration) {
+                duration = max_duration; 
+                /* Request notification upon the next completion event */
+                ret = ibv_req_notify_cq(cq, 0);
+                if (ret) {
+                    fprintf(stderr, "Couldn't request CQ notification\n");
+                    die("ibv_req_notify_cq");
+                }
+                ibv_ack_cq_events(cq, 1);
+                goto event_mode;
+            } else {
                 duration = (duration / 2);
+                goto poll_mode;
+            } 
+#endif
+
+#if 0
+            if (duration == min_duration || succ_rate < 20) {
+                duration = max_duration;
+                /* Request notification upon the next completion event */
+                ret = ibv_req_notify_cq(cq, 0);
+                if (ret) {
+                    fprintf(stderr, "Couldn't request CQ notification\n");
+                    die("ibv_req_notify_cq");
+                }
+                ibv_ack_cq_events(cq, 1);
+                goto event_mode;
+            }
+
+            if (succ_rate > 80) {
+                duration = grad_duration_decrease(duration.count()) * 1ms;
+            } else if (succ_rate > 20) {
+                duration = exp_duration_decrease(duration.count()) * 1ms;
+            } else {
+                throw std::runtime_error("hp: succ rate cannnot < 20");
+            }
+            goto poll_mode;
+#endif
+        } else {
             /* Request notification upon the next completion event */
             ret = ibv_req_notify_cq(cq, 0);
             if (ret) {
@@ -493,13 +576,7 @@ retry:
                 die("ibv_req_notify_cq");
             }
             ibv_ack_cq_events(cq, 1);
-            goto event_mode;
-        } else {
-            if (config.wc_mode == WC_ADAPTIVE_BO && 
-                    succ_rate > 80 && duration < max_duration)
-                duration = (duration * 2);
-            /* else predict well => not change the duration */
-            goto poll_mode;
+            goto event_mode;       
         }
 #endif
     }
@@ -589,10 +666,10 @@ static void create_qp(struct rdma_queue *q) {
 
     if (q->id < rdma_config.num_data_qps) {
         if (config.wc_mode == WC_BUSY_WAITING) {
-            send_cq = ibv_create_cq(q->cm_id->verbs, CQ_NUM_CQES, NULL, NULL, 
-                    0);
-            recv_cq = ibv_create_cq(q->cm_id->verbs, CQ_NUM_CQES, NULL, NULL, 
-                    0);  
+			send_cq = ibv_create_cq(q->cm_id->verbs, CQ_NUM_CQES, NULL, NULL, 
+					0);
+			recv_cq = ibv_create_cq(q->cm_id->verbs, CQ_NUM_CQES, NULL, NULL, 
+					0);  
         } else {
             /* hybrid polling */
             q->channel = ibv_create_comp_channel(q->ctrl->rdev->verbs);
@@ -705,12 +782,12 @@ int create_data_cq_handler(struct rdma_queue *q, int cli_id, int queue_id) {
 }
 
 int create_global_data_cq_handler(void) {
-    for (int i = 0; i < rdma_config.num_data_qps; i++) {
-        thread p = thread(data_cq_poller, nullptr, i);
-        set_thread_affinity(p, i);
-        p.detach();
-    }
-    return 0;
+	for (int i = 0; i < rdma_config.num_data_qps; i++) {
+		thread p = thread(data_cq_poller, nullptr, i);
+		set_thread_affinity(p, i);
+		p.detach();
+	}
+	return 0;
 }
 
 inline int create_filter_cq_handler(struct rdma_queue *q) {
@@ -1007,14 +1084,14 @@ struct dcc_rdma_ctrl *alloc_control() {
 }
 
 void dcc_rdma_set_default_config() {
-    rdma_config.num_get_qps = 6;
+    rdma_config.num_get_qps = 1; // 6 is not okay
     rdma_config.num_data_qps = 2 + rdma_config.num_get_qps;
     rdma_config.num_filter_qps = 1;
     rdma_config.num_qps = rdma_config.num_data_qps +
         rdma_config.num_filter_qps;
     rdma_config.num_msgs = 512;
     rdma_config.get_metadata_size = sizeof(uint64_t) * 2;
-    rdma_config.inv_metadata_size = sizeof(uint64_t) * rdma_config.num_msgs;
+    rdma_config.inv_metadata_size = sizeof(uint64_t);
     rdma_config.metadata_size = rdma_config.get_metadata_size +
         rdma_config.inv_metadata_size;
     rdma_config.metadata_mr_size = rdma_config.num_data_qps *
@@ -1026,7 +1103,7 @@ struct dcc_rdma_ctrl *init_rdma(int cid) {
 
     if (cid == 0) {
         dcc_rdma_set_default_config();
-        cpu_monitor = new CPUMonitor(3);
+        cpu_monitor = new CPUMonitor(1);
     }
 
     ctrl = alloc_control();

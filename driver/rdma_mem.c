@@ -84,7 +84,8 @@ int rdma_mem_alloc_region(struct dcc_rdma_ctrl *ctrl)
 	
 	/* key buffer */
 	key_mm_pool->ptr = ib_dma_alloc_coherent(rdev->dev,
-			sizeof(u64) * rdma_config.num_msgs, 
+			sizeof(u64) * rdma_config.num_msgs * 
+			rdma_config.num_data_qps, 
 			&key_mm_pool->dma_addr,
 			GFP_KERNEL);
 	if (!key_mm_pool->dma_addr) {
@@ -92,7 +93,8 @@ int rdma_mem_alloc_region(struct dcc_rdma_ctrl *ctrl)
 		return -ENOMEM;
 	}
 	ib_dma_sync_single_for_device(rdev->dev, key_mm_pool->dma_addr,
-			sizeof(u64) * rdma_config.num_msgs, 
+			sizeof(u64) * rdma_config.num_msgs * 
+			rdma_config.num_data_qps, 
 			DMA_TO_DEVICE);
 
 	pagebuf_mm_pool->ptr = ib_dma_alloc_coherent(rdev->dev,
@@ -105,7 +107,7 @@ int rdma_mem_alloc_region(struct dcc_rdma_ctrl *ctrl)
 			PAGE_SIZE, DMA_TO_DEVICE);
 
 	/* keypage put buffer */
-	size = (sizeof(u64) + PAGE_SIZE) * rdma_config.num_msgs;
+	size = (sizeof(u64) + PAGE_SIZE) * (rdma_config.num_msgs + 1);
 	keypage_mm_pool->ptr = ib_dma_alloc_coherent(rdev->dev,
 			size, &keypage_mm_pool->dma_addr, GFP_KERNEL);
 	if (!keypage_mm_pool->dma_addr) {
@@ -114,6 +116,7 @@ int rdma_mem_alloc_region(struct dcc_rdma_ctrl *ctrl)
 	}
 	ib_dma_sync_single_for_device(rdev->dev, keypage_mm_pool->dma_addr,
 			size, DMA_TO_DEVICE);
+
 	return 0;
 }
 
@@ -135,14 +138,15 @@ void rdma_mem_free_region(struct dcc_rdma_ctrl *ctrl)
 	}
 
 	ib_dma_free_coherent(ctrl->rdev->dev, 
-			sizeof(u64) * rdma_config.num_msgs, 
+			sizeof(u64) * rdma_config.num_msgs * 
+			rdma_config.num_data_qps, 
 			key_mm_pool->ptr, key_mm_pool->dma_addr);
 
 	ib_dma_free_coherent(ctrl->rdev->dev,
 			PAGE_SIZE, pagebuf_mm_pool->ptr, 
 			pagebuf_mm_pool->dma_addr);
 	
-	size = (sizeof(u64) + PAGE_SIZE) * rdma_config.num_msgs;
+	size = (sizeof(u64) + PAGE_SIZE) * (rdma_config.num_msgs + 1);
 	ib_dma_free_coherent(ctrl->rdev->dev, size, 
 			keypage_mm_pool->ptr, 
 			keypage_mm_pool->dma_addr);

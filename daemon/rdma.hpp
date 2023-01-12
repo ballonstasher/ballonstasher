@@ -183,6 +183,18 @@ static inline uint64_t ADDR_META_REGION(uint64_t addr, int qid, int mid) {
     return KEY_META_REGION(addr, qid, mid, MSG_READ) + sizeof(uint64_t);
 }
 
+#define fls(x)                      (64 - __builtin_clzll(x))
+#define __rounddown_pow_of_two(x)   (1UL << (fls(x) - 1))
+#define __rounddown_pow_of_two2(x)  (1UL << (fls(x) - 2))
+#define is_power_of_two(x)          (x && !((x - 1) & x))
+
+static int inline grad_duration_decrease(uint64_t x) {
+        return (x + __rounddown_pow_of_two2(x)) / 2;
+}
+
+static int inline exp_duration_decrease(uint64_t x) {
+        return __rounddown_pow_of_two2(x);
+}
 
 int run_rdma(int, int);
 struct dcc_rdma_ctrl *init_rdma(int);

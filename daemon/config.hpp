@@ -12,6 +12,7 @@ struct daemon_config_t {
     bool cbf_on;
     int wc_mode;
     int poller_type;
+    int rejected_cpu_thld;
 };
 extern struct daemon_config_t config;
 

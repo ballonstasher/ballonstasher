@@ -26,22 +26,37 @@ static inline void poll_send_cq(struct rdma_queue *q)
 	__poll_cq(&wc, q->qp->send_cq);
 }
 
-static inline int poll_recv_cq(struct rdma_queue *q, int *etc, int *crc)
+static inline int poll_recv_cq(struct rdma_queue *q, int *crc)
 {
 	struct ib_wc wc = {};
 	int ret;
-	int mid, msg_type, tx_state;
-	
+	int mid, msg_type, tx_state, etc;
+
 	__poll_cq(&wc, q->qp->recv_cq);
 	
 	if (!wc.ex.imm_data)
 		return 0;
 
 	bit_unmask(ntohl(wc.ex.imm_data), &mid, &msg_type, &tx_state, 
-			etc, crc);
-
+			&etc, crc);
+	
 	switch (tx_state) {
 		case TX_WRITE_COMMITTED:
+			if (config.monitor_remote_status) {
+				if (etc) {
+#if 1
+					q->ctrl->disable_when = jiffies;
+#else
+					q->ctrl->disable_when = ktime_get();
+#endif
+					q->ctrl->remote_disable = true;
+					q->msg_id = 0;
+				} else {
+					q->ctrl->remote_disable = false;
+				}
+			}
+			ret = 0;
+			break;
 		case TX_INV_PAGE_COMMITED:
 			ret = 0;
 			break;
@@ -60,6 +75,7 @@ static inline int poll_recv_cq(struct rdma_queue *q, int *etc, int *crc)
 	return ret;
 }
 
+/* TODO: stack frame size */
 void send_page_work_handler(struct work_struct *work)
 {
 	struct work_data *data = (struct work_data *) work;
@@ -70,7 +86,6 @@ void send_page_work_handler(struct work_struct *work)
 	const struct ib_send_wr *bad_wr;
 	int msg_id = data->msg_id;
 	int ret;
-	int etc = 0;
 	int i;
 	u32 imm;
 	
@@ -114,7 +129,8 @@ void send_page_work_handler(struct work_struct *work)
 	clear_bit(msg_id / rdma_config.num_put_batch, &ctrl->wait);
 
 	if (msg_id == rdma_config.num_msgs - 1) { 
-		ret = poll_recv_cq(q, &etc, NULL);
+		ret = poll_recv_cq(q, NULL);
+
 		post_recv(q, 0, 0);
 	}
 	
@@ -138,9 +154,48 @@ static inline void copy_to_send_buffer(struct dcc_rdma_ctrl *ctrl, u64 key,
 	memcpy((void *) key_loc, &key, sizeof(u64));
 }
 
+int __dcc_rdma_send_page(struct rdma_queue *q, struct page *page, u64 key)
+{
+	struct dcc_rdma_ctrl *ctrl = q->ctrl;
+	struct ib_sge sge = {};
+	struct ib_rdma_wr rdma_wr = {};
+	const struct ib_send_wr *bad_wr;
+	size_t len = sizeof(u64) + PAGE_SIZE;
+	int num_msgs = rdma_config.num_msgs;
+	int msg_id = num_msgs - 1;
+	u32 imm;
+	int ret;
+	
+	copy_to_send_buffer(ctrl, key, page, num_msgs);
+
+	sge.addr   = KEYPAGE_MM_POOL(ctrl).dma_addr + len * num_msgs;
+	sge.length = len;
+	sge.lkey   = ctrl->rdev->pd->local_dma_lkey;
+
+	imm = htonl(bit_mask(msg_id, MSG_WRITE, TX_WRITE_BEGIN, 0, 0));
+
+	rdma_wr.wr.next        = NULL;
+	rdma_wr.wr.wr_id       = 0;
+	rdma_wr.wr.sg_list     = &sge;
+	rdma_wr.wr.num_sge     = 1;
+	rdma_wr.wr.opcode      = IB_WR_SEND_WITH_IMM;
+	rdma_wr.wr.send_flags  = IB_SEND_SIGNALED;
+	rdma_wr.wr.ex.imm_data = imm;
+
+	ret = ib_post_send(q->qp, &rdma_wr.wr, &bad_wr);
+	if (unlikely(ret))
+		pr_err("%s: ib_post_send failed: %d", __func__, ret);
+	poll_send_cq(q);
+
+	ret = poll_recv_cq(q, NULL);
+
+	return ret;
+}
+
+#define MAX_SEND_PAGE_RETRY 4
 int dcc_rdma_send_page(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 {
-	int queue_id, msg_id;
+	int msg_id;
 	int ret = 0;
 	struct rdma_queue *q;
 	int num_msgs = rdma_config.num_msgs;
@@ -149,15 +204,41 @@ int dcc_rdma_send_page(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 	int num_retry = 0;
 
 	q = get_rdma_queue(ctrl, 0);
-	queue_id = q->id;
 
 	spin_lock_irqsave(&q->lock, flags);
 
+	if (config.monitor_remote_status && ctrl->remote_disable) {
+#if 1
+		if (time_after(ctrl->disable_when + 
+					msecs_to_jiffies(config.max_rejected_ms),
+					jiffies))
+#else
+			u64 diff = ktime_to_ns(ktime_sub(ktime_get(), 
+						ctrl->disable_when));
+		if (diff < 5 * NSEC_PER_SEC)
+#endif
+		{
+			ret = -7;
+			spin_unlock_irqrestore(&q->lock, flags);
+			return ret;
+		} else {
+			/* 
+			 * Time has passed since the remote was rejected, 
+			 * check the peer node status again.
+			 */
+			ret = __dcc_rdma_send_page(q, page, key); 
+
+			spin_unlock_irqrestore(&q->lock, flags);
+			post_recv(q, 0, 0);
+
+			return ret;
+		}
+	}
 	msg_id = q->msg_id++ % num_msgs;
-	
+
 	while (test_bit(msg_id / rdma_config.num_put_batch, &ctrl->wait)) {
 		//pr_info("key=%llu, msg_id=%d wait!!", key, msg_id);
-		if (num_retry++ > 5) { 
+		if (num_retry++ > MAX_SEND_PAGE_RETRY) { 
 			q->msg_id--;
 			spin_unlock_irqrestore(&q->lock, flags);
 			return -6;
@@ -204,7 +285,6 @@ int dcc_rdma_write_msg(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 	int msg_type = MSG_READ;
 	int tx_type = TX_READ_BEGIN;
 	int crc;
-	unsigned long flags;
 
 	/* 0: put, 1: inv, 2 ~ N: get */
 #if 1
@@ -212,6 +292,7 @@ int dcc_rdma_write_msg(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 #else
 	q = get_rdma_queue(ctrl, key % rdma_config.num_get_qps + 2);
 #endif
+
 	/* DMA PAGE */
 	ret = get_req_for_page(&req, rdev->dev, page, DMA_FROM_DEVICE);
 	if (unlikely(ret)) {
@@ -221,6 +302,8 @@ int dcc_rdma_write_msg(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 	/* set metadata */
 	meta.key = key;
 	meta.raddr = req->dma;
+
+	msg_id = 0;
 
 	/* setup imm data */
 	imm = htonl(bit_mask(msg_id, msg_type, tx_type, 0, 0));
@@ -242,11 +325,10 @@ int dcc_rdma_write_msg(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 		GET_METADATA_OFFSET(q->id, msg_id, msg_type);
 	rdma_wr.rkey           = SVR_MM_INFO(ctrl).key;
 
-	//mutex_lock(&q->mtx);
-	spin_lock_irqsave(&q->lock, flags);
-
 	/* to keep key order with invalidation */
-	//while (hashtable_get(ctrl->ht, key) == key) { }
+	while (hashtable_get(ctrl->ht, key) == key) { }
+
+	mutex_lock(&q->mtx);
 
 	/* request => reply */
 	ret = ib_post_send(q->qp, &rdma_wr.wr, &bad_wr);
@@ -255,10 +337,9 @@ int dcc_rdma_write_msg(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 	}
 	poll_send_cq(q);
 	
-	ret = poll_recv_cq(q, NULL, &crc);
+	ret = poll_recv_cq(q, &crc);
 	
-	//mutex_unlock(&q->mtx);
-	spin_unlock_irqrestore(&q->lock, flags);
+	mutex_unlock(&q->mtx);
 
 	post_recv(q, 0, 0);
 
@@ -275,65 +356,79 @@ int dcc_rdma_write_msg(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
 	return ret;
 }
 
-/* for inv_page2 */
-int dcc_rdma_write_msg2(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
+void write_msg2_work_handler(struct work_struct *work)
 {
-	int msg_id;
-	int ret;
-	u32 imm;
-	struct rdma_queue *q;
+	struct work_data *data = (struct work_data *) work;
+	struct rdma_queue *q = data->q;
+	struct dcc_rdma_ctrl *ctrl = q->ctrl;
 	struct ib_sge sge = {};
 	struct ib_rdma_wr rdma_wr = {};
 	const struct ib_send_wr *bad_wr;
-	struct rdma_dev *rdev = ctrl->rdev; 
-	int num_msgs = rdma_config.num_msgs;
-	unsigned long flags;
+	int msg_id = 0;
+	u32 imm;
+	int ret;
 
-	q = get_rdma_queue(ctrl, 1);
-
-	//hashtable_insert(ctrl->ht, key, key);
-	
 	/* request (key, raddr) */
-	sge.addr   = (u64) &key;
+	sge.addr   = (u64) &data->key;
 	sge.length = sizeof(u64);
-	sge.lkey   = rdev->pd->local_dma_lkey;
+	sge.lkey   = q->ctrl->rdev->pd->local_dma_lkey;
+
+	/* setup imm data */
+	imm = htonl(bit_mask(msg_id, MSG_INV_PAGE, TX_INV_PAGE_BEGIN, 0, 0));
 
 	rdma_wr.wr.next        = NULL;
 	rdma_wr.wr.wr_id       = 0;
 	rdma_wr.wr.sg_list     = &sge;
 	rdma_wr.wr.num_sge     = 1;
 	rdma_wr.wr.opcode      = IB_WR_RDMA_WRITE_WITH_IMM;
-	
-	spin_lock_irqsave(&q->lock, flags);
-	msg_id = q->msg_id++ % num_msgs;
-	/* setup imm data */
-	imm = htonl(bit_mask(msg_id, MSG_INV_PAGE, TX_INV_PAGE_BEGIN, 0, 0));
+	rdma_wr.wr.send_flags  = IB_SEND_SIGNALED | IB_SEND_INLINE;
 	rdma_wr.wr.ex.imm_data = imm;
-	rdma_wr.wr.send_flags  = msg_id < num_msgs - 1 ? 
-		IB_SEND_INLINE : IB_SEND_SIGNALED | IB_SEND_INLINE;
 	rdma_wr.remote_addr    = SVR_MM_INFO(ctrl).baseaddr + 
 		GET_METADATA_OFFSET(q->id, msg_id, MSG_INV_PAGE);
 	rdma_wr.rkey           = SVR_MM_INFO(ctrl).key;
-
+	
+	mutex_lock(&q->mtx);
+	
 	/* request => reply */
 	ret = ib_post_send(q->qp, &rdma_wr.wr, &bad_wr);
 	if (unlikely(ret)) {
 		pr_err("ib_post_send failed: %d", ret);
 	}
 
-	if (msg_id < num_msgs - 1) {
-		spin_unlock_irqrestore(&q->lock, flags);
-	} else {
-		poll_send_cq(q);
-		ret = poll_recv_cq(q, NULL, NULL);
-		spin_unlock_irqrestore(&q->lock, flags);
-		post_recv(q, 0, 0);
+	poll_send_cq(q);
+	
+	ret = poll_recv_cq(q, NULL);
+	
+	mutex_unlock(&data->q->mtx);
+	
+	hashtable_remove(q->ctrl->ht, data->key);
+	
+	post_recv(q, 0, 0);
+	kfree(data);
+}
+
+/* for inv_page2 */
+int dcc_rdma_write_msg2(struct dcc_rdma_ctrl *ctrl, struct page *page, u64 key)
+{
+	int ret = 1;
+	struct rdma_queue *q;
+	struct work_data *data;
+
+	q = get_rdma_queue(ctrl, 1);
+	
+	hashtable_insert(ctrl->ht, key, key);
+	
+	data = kmalloc(sizeof(struct work_data), GFP_ATOMIC);
+	INIT_WORK(&data->work, write_msg2_work_handler);
+	data->q = q;
+	data->key = key;
+
+	if (!schedule_work(&data->work)) {
+		pr_err("%s: failed to schedule_work", __func__);
 	}
 
-	//hashtable_remove(q->ctrl->ht, key);
-
 	dcc_rdma_debug("key=%llu, qid=%d, ret=%d", key, q->id, ret);
-
+	
 	return ret;
 }
 
@@ -362,6 +457,7 @@ int dcc_rdma_send_msg(struct rdma_queue *q, u64 addr, u32 bufsize, u32 imm)
 	if (unlikely(ret)) {
 		pr_err("ib_post_send failed: %d", ret);
 	}
+
 	return ret;
 }
 
@@ -444,7 +540,7 @@ static int dcc_rdma_recv_remotemr(struct dcc_rdma_ctrl *ctrl)
 		goto out_free_req;
 
 	udelay(10); /* this delay doesn't really matter, only happens once */
-	poll_recv_cq(&ctrl->queues[0], NULL, NULL);
+	poll_recv_cq(&ctrl->queues[0], NULL);
 
 	ib_dma_unmap_single(dev, req->dma, sizeof(struct mm_info),
 			DMA_FROM_DEVICE);
@@ -811,8 +907,8 @@ static struct dcc_rdma_ctrl *dcc_rdma_alloc_control(int id)
 	if (IS_ERR(ctrl->mm)) {
 		goto out_free_queues;
 	}
-	
-	ctrl->ht = hashtable_init(128);
+
+	ctrl->ht = hashtable_init(rdma_config.num_msgs);
 	if (!ctrl->ht) {
 		goto out_free_mm;	
 	}
@@ -878,7 +974,7 @@ static struct ib_client dcc_rdma_ib_client = {
 
 void dcc_rdma_set_default_config(void) 
 {
-	rdma_config.num_get_qps = 6;
+	rdma_config.num_get_qps = 1; // XXX: 4, 6 is not ok..
 	rdma_config.num_data_qps = 2 + rdma_config.num_get_qps;
 	rdma_config.num_filter_qps = 1;
 	rdma_config.num_qps = rdma_config.num_data_qps + 
@@ -886,7 +982,7 @@ void dcc_rdma_set_default_config(void)
 	rdma_config.num_msgs = 512;	// 1 MB
 	rdma_config.num_put_batch = 32; // 128 KB
 	rdma_config.get_metadata_size = sizeof(uint64_t) * 2;
-	rdma_config.inv_metadata_size = sizeof(uint64_t) * rdma_config.num_msgs;
+	rdma_config.inv_metadata_size = sizeof(uint64_t);
 	rdma_config.metadata_size = rdma_config.get_metadata_size + 
 		rdma_config.inv_metadata_size;
 	rdma_config.metadata_mr_size = rdma_config.num_data_qps * 

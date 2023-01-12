@@ -116,7 +116,7 @@ static inline bool metadata_remove(metadata_t *meta, const void *data,
 	switch (meta->type) {
 		case COOP_BF:
 		case ORDINARY_BF:
-			return 1; 
+			return bf_might_contain(meta->bf, data, data_len); 
 		case COUNTING_BF:
 			return cbf_remove(meta->cbf, data, data_len); 
 		case HASH_TABLE:

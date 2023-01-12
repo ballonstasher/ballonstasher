@@ -168,5 +168,4 @@ module_init(dcc_init);
 module_exit(dcc_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("");
 MODULE_DESCRIPTION("Cleancache backend driver");

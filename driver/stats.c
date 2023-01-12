@@ -9,7 +9,7 @@ const char *dcc_stats_names[] = {
 	"rejected_puts",
 	"clean_puts",
 	"redirtied_puts",
-	"access_filtered_puts",
+	"access_filtered_put",
 	"false_positive_gets",
 	"crc_error_gets",
 	"valid_invalidates",
