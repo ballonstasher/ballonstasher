@@ -1,0 +1,9 @@
+[submodule "prefetch-cache-target"]
+	path = prefetch-cache-target
+	url = git@github.com-ballonstasher:ballonstasher/prefetch-cache-target.git
+[submodule "prefetch-cache-initiator"]
+	path = prefetch-cache-initiator
+	url = git@github.com-ballonstasher:ballonstasher/prefetch-cache-initiator.git
+[submodule "cleancache-rdma"]
+	path = cleancache-rdma
+	url = git@github.com-ballonstasher:ballonstasher/cleancache-rdma
